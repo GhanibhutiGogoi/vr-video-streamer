@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>VR Player</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; color: #eee;
+               font-family: -apple-system, system-ui, sans-serif; }
+  /* the video element must stay technically visible for WebGL texture upload on iOS */
+  #vid { position: fixed; top: 0; left: 0; width: 2px; height: 2px; opacity: 0.01; pointer-events: none; }
+  #cv { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
+
+  #gate { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; gap: 18px;
+          align-items: center; justify-content: center; background: rgba(0,0,0,.88); text-align: center; }
+  #enter { font-size: 22px; padding: 16px 42px; border-radius: 40px; border: 2px solid #6cf;
+           background: rgba(40,90,140,.5); color: #fff; }
+  #gate-status { font-size: 14px; color: #9ab; max-width: 80%; }
+
+  #hud { position: fixed; inset: 0; z-index: 10; display: none; pointer-events: none; }
+  #hud.show { display: block; }
+  #title { position: absolute; top: env(safe-area-inset-top, 8px); left: 0; right: 0; padding: 10px;
+           text-align: center; font-size: 14px; color: #fff; text-shadow: 0 1px 3px #000;
+           background: linear-gradient(rgba(0,0,0,.6), transparent); }
+  #controls { position: absolute; bottom: calc(env(safe-area-inset-bottom, 0px) + 14px); left: 0; right: 0;
+              display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; pointer-events: auto; }
+  .grp { display: flex; background: rgba(20,20,25,.85); border-radius: 24px; overflow: hidden;
+         border: 1px solid rgba(255,255,255,.15); }
+  .grp button { font-size: 13px; padding: 10px 14px; border: none; background: transparent; color: #bcd; }
+  .grp button.on { background: #2a6496; color: #fff; }
+
+  #toast { position: fixed; top: 18%; left: 50%; transform: translateX(-50%); z-index: 30;
+           background: rgba(20,20,25,.92); border: 1px solid rgba(255,255,255,.2); color: #fff;
+           padding: 10px 18px; border-radius: 10px; font-size: 14px; max-width: 84%; text-align: center;
+           opacity: 0; transition: opacity .25s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<video id="vid" playsinline webkit-playsinline preload="auto" crossorigin="anonymous"></video>
+<canvas id="cv"></canvas>
+
+<div id="gate">
+  <button id="enter">&#9654;&nbsp; Enter VR</button>
+  <div id="gate-status">Connecting&hellip;</div>
+</div>
+
+<div id="hud">
+  <div id="title"></div>
+  <div id="controls">
+    <div class="grp" id="proj">
+      <button data-v="360" class="on">360&deg;</button>
+      <button data-v="180">180&deg;</button>
+      <button data-v="flat">Flat</button>
+    </div>
+    <div class="grp" id="stereo">
+      <button data-v="mono" class="on">2D</button>
+      <button data-v="sbs">3D SBS</button>
+      <button data-v="tb">3D T/B</button>
+    </div>
+    <div class="grp" id="quality">
+      <button data-h="0" class="on">Auto</button>
+    </div>
+    <div class="grp">
+      <button id="back30">&#8630;5s</button>
+      <button id="playpause">&#9199;</button>
+      <button id="fwd30">5s&#8631;</button>
+    </div>
+    <div class="grp">
+      <button id="recenter">&#10227; Recenter</button>
+      <button id="fs">&#x26F6; Fullscreen</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="/three.min.js"></script>
+<script src="/player.js"></script>
+</body>
+</html>

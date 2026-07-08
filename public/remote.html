@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR Streamer — Remote</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #14161a; color: #dde;
+         max-width: 40em; margin: 3em auto; padding: 0 1.5em; line-height: 1.55; }
+  h1 { font-size: 1.5em; } h2 { font-size: 1.1em; margin-top: 2em; color: #9bc; }
+  a.bm { display: inline-block; padding: 12px 26px; background: #2a6496; color: #fff;
+         border-radius: 30px; text-decoration: none; font-weight: 600; cursor: grab; }
+  input { width: 100%; padding: 11px; font-size: 15px; border-radius: 8px; margin: 6px 0;
+          border: 1px solid #445; background: #1d2127; color: #eee; }
+  button { padding: 11px 22px; font-size: 15px; border-radius: 8px; border: none;
+           background: #2a6496; color: #fff; }
+  #out { margin-top: 12px; color: #8fc98f; min-height: 1.4em; }
+  .hint { color: #889; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<h1>&#128225; VR Streamer &mdash; Remote</h1>
+
+<p>Drag this button onto Chrome&rsquo;s <b>bookmarks bar</b> (&#8984;&#8679;B if hidden):</p>
+<p><a class="bm" href="javascript:(function(){var i=new Image();i.src='https://{{HOST}}/send?url='+encodeURIComponent(location.href)+'&b='+Date.now();})();">&#9654; Send to VR</a></p>
+<p class="hint">Then on any video page, click it once &mdash; the video appears on your phone a few seconds later.</p>
+
+<h2>Or paste a video page URL — or a local file path</h2>
+<form id="f">
+  <input id="u" placeholder="https://youtube.com/watch?v=…  or  /Users/you/Movies/clip.mp4" autofocus>
+  <button>Send to phone</button>
+</form>
+<p class="hint">Local files: in Finder, right-click the file, hold &#8997; Option, choose &ldquo;Copy &hellip; as Pathname&rdquo;, paste here. Works with MP4/MOV/MKV/WebM &mdash; incompatible formats are converted on the fly.</p>
+<div id="out"></div>
+
+<h2>Now playing on the phone</h2>
+<div id="np">
+  <div id="np-title" style="font-weight:600;min-height:1.4em">&mdash; nothing yet &mdash;</div>
+  <input type="range" id="np-seek" min="0" max="0" value="0" step="1" style="width:100%;margin:10px 0">
+  <div id="np-time" class="hint">0:00 / 0:00</div>
+  <div style="display:flex;gap:8px;margin:10px 0;flex-wrap:wrap">
+    <button class="ctl" data-act="skip" data-val="-5">&#8630; 5s</button>
+    <button class="ctl" data-act="toggle">&#9199; Play / Pause</button>
+    <button class="ctl" data-act="skip" data-val="5">5s &#8631;</button>
+  </div>
+  <div id="np-quality" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+</div>
+
+<script>
+// ---- live remote control over the same WebSocket the phone uses ----
+var ws = null;
+var dragging = false;
+
+function wsConnect() {
+  ws = new WebSocket('wss://' + location.host + '/ws');
+  ws.onclose = function () { setTimeout(wsConnect, 2000); };
+  ws.onmessage = function (ev) {
+    var msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === 'video') {
+      document.getElementById('np-title').textContent = msg.title || 'Video';
+      buildQuality(msg.heights || [], msg.quality || 0);
+    } else if (msg.type === 'state') {
+      document.getElementById('np-title').textContent = msg.title || 'Video';
+      var seek = document.getElementById('np-seek');
+      if (msg.duration) seek.max = Math.floor(msg.duration);
+      if (!dragging) seek.value = Math.floor(msg.t || 0);
+      document.getElementById('np-time').textContent =
+        fmt(msg.t) + ' / ' + fmt(msg.duration) + (msg.paused ? '  (paused)' : '');
+    }
+  };
+}
+wsConnect();
+
+function fmt(s) {
+  s = Math.max(0, Math.floor(s || 0));
+  var m = Math.floor(s / 60), sec = ('0' + (s % 60)).slice(-2);
+  return Math.floor(m / 60) ? Math.floor(m / 60) + ':' + ('0' + (m % 60)).slice(-2) + ':' + sec : m + ':' + sec;
+}
+
+function sendCtl(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+document.querySelectorAll('.ctl').forEach(function (b) {
+  b.addEventListener('click', function () {
+    sendCtl({ type: 'control', action: b.dataset.act, value: Number(b.dataset.val || 0) });
+  });
+});
+
+var seekBar = document.getElementById('np-seek');
+seekBar.addEventListener('pointerdown', function () { dragging = true; });
+seekBar.addEventListener('change', function () {
+  dragging = false;
+  sendCtl({ type: 'control', action: 'seek', value: Number(seekBar.value) });
+});
+
+function qLabel(h) { return h >= 4320 ? '8K' : h >= 2160 ? '4K' : h >= 1440 ? '2K' : h + 'p'; }
+function buildQuality(heights, active) {
+  var box = document.getElementById('np-quality');
+  box.innerHTML = '';
+  var mk = function (h, label) {
+    var b = document.createElement('button');
+    b.textContent = label;
+    b.style.opacity = (Number(h) === Number(active)) ? 1 : 0.55;
+    b.addEventListener('click', function () { sendCtl({ type: 'quality', height: Number(h) }); });
+    box.appendChild(b);
+  };
+  mk(0, 'Auto');
+  heights.slice(0, 6).forEach(function (h) { mk(h, qLabel(h)); });
+}
+</script>
+
+<script>
+document.getElementById('f').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var out = document.getElementById('out');
+  out.style.color = '#9bc';
+  out.textContent = 'Extracting stream… (a few seconds)';
+  try {
+    var r = await fetch('/send?url=' + encodeURIComponent(document.getElementById('u').value));
+    if (r.ok) { out.style.color = '#8fc98f'; out.textContent = '✓ Sent to phone'; }
+    else { out.style.color = '#e99'; out.textContent = 'Error: ' + await r.text(); }
+  } catch (err) {
+    out.style.color = '#e99';
+    out.textContent = 'Error: ' + err;
+  }
+});
+</script>
+</body>
+</html>
