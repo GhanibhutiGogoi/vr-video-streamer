@@ -258,6 +258,7 @@ function fillHlsHeights(picked, cb) {
 function carryProbedInfo(picked) {
   if (!current) return;
   if (!picked.height && current.height) picked.height = current.height;
+  if (!picked.localDuration && current.localDuration) picked.localDuration = current.localDuration;
   if (picked.kind === 'file' && current.kind === 'transcode' && current.vTranscode !== undefined) {
     picked.kind = 'transcode';
     picked.vTranscode = current.vTranscode;
@@ -270,14 +271,17 @@ function carryProbedInfo(picked) {
 // compatibility all work for these videos too.
 function probeRemoteHeight(picked, cb) {
   if (picked.kind !== 'file' || picked.height) return cb();
-  const args = ['-v', 'error', '-print_format', 'json', '-show_streams', '-select_streams', 'v:0'];
+  const args = ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', '-select_streams', 'v:0'];
   const hdrs = Object.entries(picked.headers || {}).map(([k, v]) => k + ': ' + v).join('\r\n');
   if (hdrs) args.push('-headers', hdrs + '\r\n');
   args.push(picked.streamUrl);
   execFile('ffprobe', args, { timeout: 15000 }, (err, stdout) => {
     if (!err) {
       try {
-        const s = (JSON.parse(stdout).streams || [])[0];
+        const info = JSON.parse(stdout);
+        const s = (info.streams || [])[0];
+        // duration feeds the remote's seek bar (yt-dlp gave us none here)
+        picked.localDuration = Number((info.format || {}).duration) || 0;
         if (s && s.height) {
           picked.height = s.height;
           if (!/^(h264|hevc)$/.test(s.codec_name || '')) {
@@ -285,7 +289,7 @@ function probeRemoteHeight(picked, cb) {
             picked.vTranscode = true;
             picked.aTranscode = true;
           }
-          console.log(`[probe] ${s.width}x${s.height} ${s.codec_name}${picked.kind === 'transcode' ? ' -> will transcode' : ''}`);
+          console.log(`[probe] ${s.width}x${s.height} ${s.codec_name}, ${Math.round(picked.localDuration)}s${picked.kind === 'transcode' ? ' -> will transcode' : ''}`);
         }
       } catch (e) { /* best effort */ }
     }
@@ -744,8 +748,12 @@ function updateScaleTarget() {
 }
 
 function videoMessage() {
+  // report the DELIVERY kind: a downscaled file is served as a transcode
+  // session, and the player must seek session-style (?t= restarts), not
+  // by setting currentTime on a growing playlist
+  const scaled = current.scaleTo > 0 && current.kind !== 'hls' && current.kind !== 'merge';
   return {
-    type: 'video', title: current.title, kind: current.kind, src: '/stream',
+    type: 'video', title: current.title, kind: scaled ? 'transcode' : current.kind, src: '/stream',
     heights: menuHeights(), quality: preferredHeight,
     duration: (current.info && current.info.duration) || current.localDuration || 0,
   };
