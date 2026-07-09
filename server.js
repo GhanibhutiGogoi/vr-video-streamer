@@ -253,6 +253,46 @@ function fillHlsHeights(picked, cb) {
   }, 0, 8000);
 }
 
+// Re-extraction returns a bare pick again — keep what an earlier ffprobe
+// learned so downscaling/transcoding decisions survive link refreshes.
+function carryProbedInfo(picked) {
+  if (!current) return;
+  if (!picked.height && current.height) picked.height = current.height;
+  if (picked.kind === 'file' && current.kind === 'transcode' && current.vTranscode !== undefined) {
+    picked.kind = 'transcode';
+    picked.vTranscode = current.vTranscode;
+    picked.aTranscode = current.aTranscode;
+  }
+}
+
+// Sniffed pages and direct links give us a bare URL with no resolution or
+// codec info — probe it so the quality ladder, auto-downscale, and codec
+// compatibility all work for these videos too.
+function probeRemoteHeight(picked, cb) {
+  if (picked.kind !== 'file' || picked.height) return cb();
+  const args = ['-v', 'error', '-print_format', 'json', '-show_streams', '-select_streams', 'v:0'];
+  const hdrs = Object.entries(picked.headers || {}).map(([k, v]) => k + ': ' + v).join('\r\n');
+  if (hdrs) args.push('-headers', hdrs + '\r\n');
+  args.push(picked.streamUrl);
+  execFile('ffprobe', args, { timeout: 15000 }, (err, stdout) => {
+    if (!err) {
+      try {
+        const s = (JSON.parse(stdout).streams || [])[0];
+        if (s && s.height) {
+          picked.height = s.height;
+          if (!/^(h264|hevc)$/.test(s.codec_name || '')) {
+            picked.kind = 'transcode'; // iPhone can't decode this directly
+            picked.vTranscode = true;
+            picked.aTranscode = true;
+          }
+          console.log(`[probe] ${s.width}x${s.height} ${s.codec_name}${picked.kind === 'transcode' ? ' -> will transcode' : ''}`);
+        }
+      } catch (e) { /* best effort */ }
+    }
+    cb();
+  });
+}
+
 // Re-apply the preferred quality to the current video by re-picking from the
 // stored yt-dlp info. May switch kinds (e.g. hls 1080p -> merge 4K).
 function applyQuality() {
@@ -463,6 +503,12 @@ function fetchChunk(cache, idx) {
     upstream(cache.url, cache.headers, `bytes=${start}-${end}`, (err, up) => {
       if (err) return reject(err);
       if (up.statusCode >= 400) { up.resume(); return reject(new Error('upstream ' + up.statusCode)); }
+      if (up.statusCode === 200) {
+        // server ignores Range — chunk caching impossible, use plain proxy
+        cache.noRange = true;
+        up.destroy();
+        return reject(new Error('no range support'));
+      }
       if (!cache.size) {
         const m = String(up.headers['content-range'] || '').match(/\/(\d+)/);
         if (m) cache.size = Number(m[1]);
@@ -494,6 +540,7 @@ function streamFileCached(req, res, onFail) {
   fetchChunk(cache, firstIdx).then(() => {
     const size = cache.size;
     if (!size) return onFail(new Error('upstream sent no content-range'));
+    onFail = null; // past this point errors are mid-stream, not source-level
     if (start >= size) return send(res, 416, 'range not satisfiable', { 'Content-Range': `bytes */${size}` });
     const end = endReq !== null ? Math.min(endReq, size - 1) : size - 1;
     const headers = {
@@ -520,7 +567,10 @@ function streamFileCached(req, res, onFail) {
         res.write(slice, () => pump(i + 1));
       }).catch(() => { if (!closed) res.destroy(); });
     })(firstIdx);
-  }).catch(onFail);
+  }).catch(err => {
+    if (cache.noRange) return proxyTo(req, res, cache.url, cache.headers, false); // plain passthrough
+    if (onFail) onFail(err);
+  });
 }
 
 /*
@@ -613,6 +663,7 @@ function streamDirect(req, res, u, attempt) {
     extract(current.pageUrl, (err, picked) => {
       if (err) return send(res, 502, 'stream rejected and re-extraction failed: ' + err.message);
       picked.pageUrl = current.pageUrl;
+      carryProbedInfo(picked);
       current = picked;
       applyQuality();
       clearStreamCaches();
@@ -921,6 +972,7 @@ function streamMerged(req, res, u, attempt) {
           return send(res, 502, 'source unreachable and re-extraction failed');
         }
         picked.pageUrl = current.pageUrl;
+        carryProbedInfo(picked);
         current = picked;
         applyQuality();
         clearStreamCaches();
@@ -955,7 +1007,7 @@ function requestHandler(req, res) {
         return send(res, 500, err.message);
       }
       picked.pageUrl = target;
-      fillHlsHeights(picked, () => {
+      fillHlsHeights(picked, () => probeRemoteHeight(picked, () => {
         stopHlsSession(); // the previous video's transcoder is obsolete
         clearStreamCaches();
         current = picked;
@@ -963,7 +1015,7 @@ function requestHandler(req, res) {
         console.log(`[send] ok: "${picked.title}" (${picked.kind}${picked.height ? ', ' + picked.height + 'p' : ''}${current.scaleTo ? ', downscaling to ' + current.scaleTo + 'p' : ''})`);
         broadcast(videoMessage());
         send(res, 200, okPage(picked.title), { 'Content-Type': 'text/html; charset=utf-8' });
-      });
+      }));
     });
     return;
   }
