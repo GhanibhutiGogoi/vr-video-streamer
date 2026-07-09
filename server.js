@@ -256,17 +256,19 @@ function fillHlsHeights(picked, cb) {
 // Re-apply the preferred quality to the current video by re-picking from the
 // stored yt-dlp info. May switch kinds (e.g. hls 1080p -> merge 4K).
 function applyQuality() {
-  if (!current || !current.info) return;
-  const repick = chooseFormat(current.info, preferredHeight);
-  if (repick) {
-    repick.info = current.info;
-    repick.pageUrl = current.pageUrl;
-    repick.extractedAt = current.extractedAt; // repicked URLs are as old as their extraction
-    if (!(repick.heights && repick.heights.length) && current.heights) {
-      repick.heights = current.heights; // keep manifest-derived heights across repicks
+  if (current && current.info) {
+    const repick = chooseFormat(current.info, preferredHeight);
+    if (repick) {
+      repick.info = current.info;
+      repick.pageUrl = current.pageUrl;
+      repick.extractedAt = current.extractedAt; // repicked URLs are as old as their extraction
+      if (!(repick.heights && repick.heights.length) && current.heights) {
+        repick.heights = current.heights; // keep manifest-derived heights across repicks
+      }
+      current = repick;
     }
-    current = repick;
   }
+  updateScaleTarget();
 }
 
 // yt-dlp reports per-format cookies as Set-Cookie-style strings; the CDN just
@@ -671,10 +673,29 @@ function okPage(title) {
   return `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;background:#111;color:#eee;display:grid;place-items:center;height:100vh;margin:0"><div style="text-align:center"><h2>&#10003; Sent to phone</h2><p>${escapeHtml(title)}</p></div><script>setTimeout(function(){window.close()},1200)</script>`;
 }
 
+// Single-rendition videos (sniffed sites, direct links, local files) can
+// still be served smaller: the Mac downscales while transcoding. Offer the
+// standard ladder below the native height.
+function menuHeights() {
+  const hs = current.heights || [];
+  if (hs.length || !current.height) return hs;
+  return [current.height, 2160, 1440, 1080, 720, 480]
+    .filter((h, i, a) => h <= MAX_HEIGHT && h <= current.height && a.indexOf(h) === i)
+    .sort((a, b) => b - a);
+}
+
+// Downscale target: only when the user's ceiling is below the native height
+// and there's no real alternative rendition (HLS handles caps in-manifest).
+function updateScaleTarget() {
+  if (!current) return;
+  current.scaleTo = (current.kind !== 'hls' && preferredHeight && (current.height || 0) > preferredHeight)
+    ? preferredHeight : 0;
+}
+
 function videoMessage() {
   return {
     type: 'video', title: current.title, kind: current.kind, src: '/stream',
-    heights: current.heights || [], quality: preferredHeight,
+    heights: menuHeights(), quality: preferredHeight,
     duration: (current.info && current.info.duration) || current.localDuration || 0,
   };
 }
@@ -723,7 +744,8 @@ function sendLocal(file, res) {
       // wrong codec and/or container: remux or re-encode into HLS on the fly
       current = Object.assign(base, { kind: 'transcode', vTranscode: !vSafe, aTranscode: !aSafe });
     }
-    console.log(`[send] ok: "${title}" (local ${current.kind === 'localfile' ? 'direct' : (current.vTranscode ? 're-encode' : 'remux')})`);
+    updateScaleTarget();
+    console.log(`[send] ok: "${title}" (local ${current.kind === 'localfile' ? 'direct' : (current.vTranscode ? 're-encode' : 'remux')}${current.scaleTo ? ', downscaling to ' + current.scaleTo + 'p' : ''})`);
     broadcast(videoMessage());
     send(res, 200, okPage(title), { 'Content-Type': 'text/html; charset=utf-8' });
   });
@@ -785,7 +807,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 
 function sessionKey(t) {
   const src = current.kind === 'merge' ? current.video.url : current.streamUrl;
-  return current.kind + '|' + src + '|' + t;
+  return current.kind + '|' + src + '|' + t + '|' + (current.scaleTo || 0);
 }
 
 function stopHlsSession() {
@@ -800,12 +822,14 @@ function startHlsSession(t) {
   stopHlsSession();
   const dir = fs.mkdtempSync(path.join(HLS_ROOT, 's-'));
   const headerBlob = h => Object.entries(h || {}).map(([k, v]) => k + ': ' + v).join('\r\n') + '\r\n';
-  const single = current.kind === 'transcode'; // one muxed input vs separate video+audio
+  const single = current.kind !== 'merge'; // one muxed input vs separate video+audio
+  const scaleTo = current.scaleTo || 0;
   // vTranscode/aTranscode are set for probed local files; remote single-input
-  // transcodes re-encode both (codec unknown enough to be here at all)
+  // transcodes re-encode both (codec unknown enough to be here at all).
+  // Downscaling always forces a video re-encode.
   const vSrc = single
-    ? { url: current.streamUrl, headers: current.headers, transcode: current.vTranscode !== false }
-    : current.video;
+    ? { url: current.streamUrl, headers: current.headers, transcode: current.vTranscode !== false || scaleTo > 0 }
+    : Object.assign({}, current.video, scaleTo ? { transcode: true } : {});
   const aTranscode = single ? current.aTranscode !== false : current.audio.transcode;
 
   // for http inputs: fail fast on dead connections, auto-reconnect on drops
@@ -824,9 +848,11 @@ function startHlsSession(t) {
     args.push('-map', '0:v:0', '-map', '1:a:0');
   }
   if (vSrc.transcode) {
+    if (scaleTo) args.push('-vf', 'scale=-2:' + scaleTo);
     // generous bitrates: the re-encode should be visually transparent — the
     // LAN hop to the phone is never the bottleneck
-    const bv = current.height >= 2160 ? '36M' : current.height >= 1440 ? '20M' : '12M';
+    const bh = scaleTo || current.height || 1080;
+    const bv = bh >= 2160 ? '36M' : bh >= 1440 ? '20M' : '12M';
     args.push('-c:v', 'hevc_videotoolbox', '-b:v', bv, '-tag:v', 'hvc1');
   } else {
     args.push('-c:v', 'copy');
@@ -933,7 +959,8 @@ function requestHandler(req, res) {
         stopHlsSession(); // the previous video's transcoder is obsolete
         clearStreamCaches();
         current = picked;
-        console.log(`[send] ok: "${picked.title}" (${picked.kind}${picked.height ? ', ' + picked.height + 'p' : ''})`);
+        updateScaleTarget();
+        console.log(`[send] ok: "${picked.title}" (${picked.kind}${picked.height ? ', ' + picked.height + 'p' : ''}${current.scaleTo ? ', downscaling to ' + current.scaleTo + 'p' : ''})`);
         broadcast(videoMessage());
         send(res, 200, okPage(picked.title), { 'Content-Type': 'text/html; charset=utf-8' });
       });
@@ -953,8 +980,9 @@ function requestHandler(req, res) {
   if (p === '/stream') {
     if (!current) return send(res, 404, 'no video sent yet');
     const dispatch = () => {
-      if (current.kind === 'localfile') return streamLocalFile(req, res);
-      if (current.kind === 'merge' || current.kind === 'transcode') return streamMerged(req, res, u);
+      const scaling = current.scaleTo > 0; // downscale requires the ffmpeg path
+      if (current.kind === 'localfile' && !scaling) return streamLocalFile(req, res);
+      if (scaling || current.kind === 'merge' || current.kind === 'transcode') return streamMerged(req, res, u);
       return streamDirect(req, res, u, 0);
     };
     // CDNs throttle or expire aged signed URLs — grab a fresh link when a
