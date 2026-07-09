@@ -49,7 +49,9 @@ let current = null; // { streamUrl, headers, title, kind: 'hls' | 'file', info }
 
 // User-selected quality ceiling in pixels of height (0 = auto/best).
 // Survives across videos; settable from the phone HUD or GET /quality?h=…
-let preferredHeight = 0;
+// Defaults to 2K — the sweet spot between sharpness and CDN reliability;
+// pick 4K in the menu (or set DEFAULT_HEIGHT) when the network can take it.
+let preferredHeight = Number(process.env.DEFAULT_HEIGHT) || 1440;
 
 // callbacks queued while a stale stream link is being re-extracted
 let refreshWaiters = null;
