@@ -228,6 +228,31 @@ function runYtdlp(args, cb) {
   });
 }
 
+// Some sites expose a single adaptive HLS master with no per-format heights;
+// read the variant list out of the manifest itself so the quality menu works.
+function fillHlsHeights(picked, cb) {
+  if (picked.kind !== 'hls' || (picked.heights && picked.heights.length)) return cb();
+  upstream(picked.streamUrl, picked.headers, null, (err, up) => {
+    if (err) return cb();
+    const chunks = [];
+    up.on('data', c => chunks.push(c));
+    up.on('end', () => {
+      const body = Buffer.concat(chunks).toString('utf8');
+      const found = new Set();
+      let m;
+      const re = /RESOLUTION=\d+x(\d+)/gi;
+      while ((m = re.exec(body))) found.add(Number(m[1]));
+      const hs = [...found].filter(h => h <= MAX_HEIGHT).sort((a, b) => b - a);
+      if (hs.length) {
+        picked.heights = hs;
+        console.log('[send] variant heights from master manifest: ' + hs.join(', '));
+      }
+      cb();
+    });
+    up.on('error', () => cb());
+  }, 0, 8000);
+}
+
 // Re-apply the preferred quality to the current video by re-picking from the
 // stored yt-dlp info. May switch kinds (e.g. hls 1080p -> merge 4K).
 function applyQuality() {
@@ -237,6 +262,9 @@ function applyQuality() {
     repick.info = current.info;
     repick.pageUrl = current.pageUrl;
     repick.extractedAt = current.extractedAt; // repicked URLs are as old as their extraction
+    if (!(repick.heights && repick.heights.length) && current.heights) {
+      repick.heights = current.heights; // keep manifest-derived heights across repicks
+    }
     current = repick;
   }
 }
@@ -901,12 +929,14 @@ function requestHandler(req, res) {
         return send(res, 500, err.message);
       }
       picked.pageUrl = target;
-      stopHlsSession(); // the previous video's transcoder is obsolete
-      clearStreamCaches();
-      current = picked;
-      console.log(`[send] ok: "${picked.title}" (${picked.kind}${picked.height ? ', ' + picked.height + 'p' : ''})`);
-      broadcast(videoMessage());
-      send(res, 200, okPage(picked.title), { 'Content-Type': 'text/html; charset=utf-8' });
+      fillHlsHeights(picked, () => {
+        stopHlsSession(); // the previous video's transcoder is obsolete
+        clearStreamCaches();
+        current = picked;
+        console.log(`[send] ok: "${picked.title}" (${picked.kind}${picked.height ? ', ' + picked.height + 'p' : ''})`);
+        broadcast(videoMessage());
+        send(res, 200, okPage(picked.title), { 'Content-Type': 'text/html; charset=utf-8' });
+      });
     });
     return;
   }
