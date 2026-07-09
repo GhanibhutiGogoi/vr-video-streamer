@@ -32,6 +32,9 @@
   .grp button { font-size: 13px; padding: 10px 14px; border: none; background: transparent; color: #bcd; }
   .grp button.on { background: #2a6496; color: #fff; }
 
+  #divider { position: fixed; left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+             background: rgba(255,255,255,.07); z-index: 5; pointer-events: none; }
+
   #toast { position: fixed; top: 18%; left: 50%; transform: translateX(-50%); z-index: 30;
            background: rgba(20,20,25,.92); border: 1px solid rgba(255,255,255,.2); color: #fff;
            padding: 10px 18px; border-radius: 10px; font-size: 14px; max-width: 84%; text-align: center;
@@ -42,6 +45,7 @@
 <body>
 <video id="vid" playsinline webkit-playsinline preload="auto" crossorigin="anonymous"></video>
 <canvas id="cv"></canvas>
+<div id="divider"></div>
 
 <div id="gate">
   <button id="enter">&#9654;&nbsp; Enter VR</button>
@@ -51,6 +55,10 @@
 <div id="hud">
   <div id="title"></div>
   <div id="controls">
+    <div class="grp" id="view">
+      <button data-v="vr" class="on">&#129405; Headset</button>
+      <button data-v="360">&#129305; Handheld</button>
+    </div>
     <div class="grp" id="proj">
       <button data-v="360" class="on">360&deg;</button>
       <button data-v="180">180&deg;</button>

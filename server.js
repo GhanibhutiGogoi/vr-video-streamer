@@ -54,9 +54,11 @@ let preferredHeight = 0;
 // callbacks queued while a stale stream link is being re-extracted
 let refreshWaiters = null;
 
-// Hard resolution ceiling: 4K rarely survives real-world CDN speeds +
-// transcoding, so cap everything at 2K. Override with MAX_HEIGHT=2160 etc.
-const MAX_HEIGHT = Number(process.env.MAX_HEIGHT) || 1440;
+// Resolution ceiling for the quality menu and auto mode. VR video spreads its
+// pixels around a whole sphere, so high source resolution matters double —
+// 4K stays available even though it needs a fast connection to keep up.
+// Override with MAX_HEIGHT=1440 (etc.) if your network can't sustain it.
+const MAX_HEIGHT = Number(process.env.MAX_HEIGHT) || 2160;
 
 // ffmpeg unlocks resolutions that only exist as separate video/audio streams
 // (e.g. YouTube above 1080p) by merging them on the fly.
@@ -354,7 +356,7 @@ function chooseFormat(info, maxHeight) {
 
 // -------------------------------------------------------------- proxy layer
 
-function upstream(urlStr, extraHeaders, range, cb, depth = 0) {
+function upstream(urlStr, extraHeaders, range, cb, depth = 0, timeoutMs = 30000) {
   let u;
   try { u = new URL(urlStr); } catch (e) { return cb(e); }
   const mod = u.protocol === 'http:' ? http : https;
@@ -369,13 +371,24 @@ function upstream(urlStr, extraHeaders, range, cb, depth = 0) {
     const code = resp.statusCode;
     if ([301, 302, 303, 307, 308].includes(code) && resp.headers.location && depth < 6) {
       resp.resume();
-      return upstream(new URL(resp.headers.location, u).href, extraHeaders, range, cb, depth + 1);
+      return upstream(new URL(resp.headers.location, u).href, extraHeaders, range, cb, depth + 1, timeoutMs);
     }
     cb(null, resp, u.href);
   });
   req.on('error', cb);
-  req.setTimeout(30000, () => req.destroy(new Error('upstream timeout')));
+  req.setTimeout(timeoutMs, () => req.destroy(new Error('upstream timeout')));
   req.end();
+}
+
+// Quick reachability check (covers TCP connect + first byte). CDN edges can
+// be individually dead or blocked while the rest of the site works.
+function preflight(url, headers, cb) {
+  if (!/^https?:/i.test(url)) return cb(true); // local file
+  upstream(url, headers, 'bytes=0-0', (err, up) => {
+    if (err) return cb(false);
+    up.resume();
+    cb(up.statusCode < 400);
+  }, 0, 8000);
 }
 
 function proxyPath(absUrl) { return '/proxy?u=' + b64urlEncode(absUrl); }
@@ -717,13 +730,19 @@ function streamLocalFile(req, res) {
  * writes playlist + fMP4 segments to a temp dir; /stream serves the playlist,
  * /hls/<file> serves segments.
  */
-// sweep session dirs left behind by previous runs (crashes, force-quits)
+// Sweep session dirs left behind by previous runs (crashes, force-quits).
+// Dirs are stamped with their server's PID so a second instance never
+// deletes a still-running server's active session.
 try {
   for (const d of fs.readdirSync(os.tmpdir())) {
-    if (d.startsWith('vr-hls-')) fs.rm(path.join(os.tmpdir(), d), { recursive: true, force: true }, () => {});
+    const m = d.match(/^vr-hls-(\d+)-/);
+    if (!m) continue;
+    let alive = false;
+    try { process.kill(Number(m[1]), 0); alive = true; } catch (e) { /* dead */ }
+    if (!alive) fs.rm(path.join(os.tmpdir(), d), { recursive: true, force: true }, () => {});
   }
 } catch (e) { /* best effort */ }
-const HLS_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'vr-hls-'));
+const HLS_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'vr-hls-' + process.pid + '-'));
 let hlsSession = null; // { key, dir, ff }
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -759,21 +778,25 @@ function startHlsSession(t) {
     : current.video;
   const aTranscode = single ? current.aTranscode !== false : current.audio.transcode;
 
+  // for http inputs: fail fast on dead connections, auto-reconnect on drops
+  const netFlags = ['-rw_timeout', '15000000', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'];
   const args = ['-hide_banner', '-loglevel', 'error'];
   if (t) args.push('-ss', String(t));
   // hardware decode where possible (falls back to software automatically)
   if (vSrc.transcode) args.push('-hwaccel', 'videotoolbox');
-  if (/^https?:/i.test(vSrc.url)) args.push('-headers', headerBlob(vSrc.headers));
+  if (/^https?:/i.test(vSrc.url)) args.push(...netFlags, '-headers', headerBlob(vSrc.headers));
   args.push('-i', vSrc.url);
   if (single) {
     args.push('-map', '0:v:0', '-map', '0:a:0?');
   } else {
     if (t) args.push('-ss', String(t));
-    args.push('-headers', headerBlob(current.audio.headers), '-i', current.audio.url);
+    args.push(...netFlags, '-headers', headerBlob(current.audio.headers), '-i', current.audio.url);
     args.push('-map', '0:v:0', '-map', '1:a:0');
   }
   if (vSrc.transcode) {
-    const bv = current.height >= 2160 ? '24M' : current.height >= 1440 ? '14M' : '8M';
+    // generous bitrates: the re-encode should be visually transparent — the
+    // LAN hop to the phone is never the bottleneck
+    const bv = current.height >= 2160 ? '36M' : current.height >= 1440 ? '20M' : '12M';
     args.push('-c:v', 'hevc_videotoolbox', '-b:v', bv, '-tag:v', 'hvc1');
   } else {
     args.push('-c:v', 'copy');
@@ -794,31 +817,68 @@ function startHlsSession(t) {
   const ff = spawn('ffmpeg', args);
   let errBuf = '';
   ff.stderr.on('data', d => { errBuf += d; });
-  ff.on('close', code => { if (code && errBuf) console.error('[ffmpeg] exit ' + code + ': ' + errBuf.slice(0, 400)); });
-  hlsSession = { key: sessionKey(t), dir, ff };
+  ff.on('close', code => {
+    if (code && errBuf) console.error('[ffmpeg] exit ' + code + ': ' + errBuf.slice(0, 400));
+    if (code && hlsSession && hlsSession.dir === dir) hlsSession.dead = true; // fast-fail waiting playlist requests
+  });
+  hlsSession = { key: sessionKey(t), dir, ff, dead: false };
 }
 
-function streamMerged(req, res, u) {
+function streamMerged(req, res, u, attempt) {
+  attempt = attempt || 0;
   const t = Math.max(0, Number(u.searchParams.get('t')) || 0);
-  if (!hlsSession || hlsSession.key !== sessionKey(t)) startHlsSession(t);
-  const dir = hlsSession.dir;
-  const started = Date.now();
-  (function waitReady() {
-    let body = null;
-    try { body = fs.readFileSync(path.join(dir, 'index.m3u8'), 'utf8'); } catch (e) { /* not yet */ }
-    if (body && /\.m4s/.test(body)) {
-      const out = body.split(/\r?\n/).map(line => {
-        const s = line.trim();
-        if (!s) return line;
-        if (s.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (m, uri) => 'URI="/hls/' + uri + '"');
-        return '/hls/' + s;
-      }).join('\n');
-      return send(res, 200, out, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+
+  const vUrl = current.kind === 'merge' ? current.video.url : current.streamUrl;
+  const vHeaders = current.kind === 'merge' ? current.video.headers : current.headers;
+  const sessionIsFresh = hlsSession && hlsSession.key === sessionKey(t) && !hlsSession.dead;
+
+  const begin = () => {
+    if (!hlsSession || hlsSession.key !== sessionKey(t) || hlsSession.dead) startHlsSession(t);
+    const dir = hlsSession.dir;
+    const started = Date.now();
+    (function waitReady() {
+      let body = null;
+      try { body = fs.readFileSync(path.join(dir, 'index.m3u8'), 'utf8'); } catch (e) { /* not yet */ }
+      if (body && /\.m4s/.test(body)) {
+        const out = body.split(/\r?\n/).map(line => {
+          const s = line.trim();
+          if (!s) return line;
+          if (s.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (m, uri) => 'URI="/hls/' + uri + '"');
+          return '/hls/' + s;
+        }).join('\n');
+        return send(res, 200, out, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      }
+      if (!hlsSession || hlsSession.dir !== dir) return send(res, 409, 'session replaced');
+      if (hlsSession.dead) return retryOrFail('transcoder died while starting');
+      if (Date.now() - started > 30000) { stopHlsSession(); return send(res, 502, 'transcoder did not start in time'); }
+      setTimeout(waitReady, 300);
+    })();
+  };
+
+  const retryOrFail = why => {
+    if (attempt < 2 && current.pageUrl) {
+      console.log(`[stream] ${why} — re-extracting for a fresh CDN link (attempt ${attempt + 1})…`);
+      broadcast({ type: 'status', message: 'Video source unreachable — trying a fresh link…' });
+      return extract(current.pageUrl, (err, picked) => {
+        if (err) {
+          broadcast({ type: 'error', message: 'Video source unreachable (check the Mac’s network/VPN)' });
+          return send(res, 502, 'source unreachable and re-extraction failed');
+        }
+        picked.pageUrl = current.pageUrl;
+        current = picked;
+        applyQuality();
+        clearStreamCaches();
+        stopHlsSession();
+        if (current.kind === 'merge' || current.kind === 'transcode') return streamMerged(req, res, u, attempt + 1);
+        return streamDirect(req, res, u, 0);
+      });
     }
-    if (!hlsSession || hlsSession.dir !== dir) return send(res, 409, 'session replaced');
-    if (Date.now() - started > 30000) { stopHlsSession(); return send(res, 502, 'transcoder did not start in time'); }
-    setTimeout(waitReady, 300);
-  })();
+    broadcast({ type: 'error', message: 'Video source unreachable (check the Mac’s network/VPN)' });
+    return send(res, 502, 'video source unreachable');
+  };
+
+  if (sessionIsFresh) return begin(); // already running — just serve the playlist
+  preflight(vUrl, vHeaders, ok => (ok ? begin() : retryOrFail('CDN not responding')));
 }
 
 function requestHandler(req, res) {

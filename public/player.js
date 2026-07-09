@@ -18,12 +18,13 @@
 
   var projection = '360'; // '360' | '180' | 'flat'
   var stereo = 'mono';    // 'mono' | 'sbs'  | 'tb'
+  var viewMode = 'vr';    // 'vr' (headset: stereo + lens correction) | '360' (handheld magic window)
   var gotGyro = false;
   var firstGyro = true;
 
   // ------------------------------------------------------------- three.js
   var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 3)); // full Retina — 2x visibly softens video
   var scene = new THREE.Scene();
   scene.background = new THREE.Color(0x000000);
   var camera = new THREE.PerspectiveCamera(80, 1, 0.1, 1000);
@@ -31,6 +32,7 @@
   var texture = new THREE.VideoTexture(vid);
   texture.minFilter = THREE.LinearFilter;
   texture.magFilter = THREE.LinearFilter;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy(); // sharp at glancing angles on the sphere
 
   var meshL = null, meshR = null;
 
@@ -144,30 +146,101 @@
   window.addEventListener('pointerup', function () { dragging = false; });
 
   // ----------------------------------------------------------- render loop
+  // --- Cardboard lens-correction pipeline --------------------------------
+  // Each eye renders to a texture; a barrel-distortion pass then counteracts
+  // the pincushion distortion of the headset lenses (the round "fisheye"
+  // viewports real Cardboard apps show). k1/k2 are Cardboard v2-ish
+  // coefficients; FOV is widened to optics scale so the world feels 1:1.
+  var VR_FOV = 96;
+  var IPD = 0.064; // metres between the eye cameras (real depth on 3D content)
+
+  var rtL = null, rtR = null;
+  var distScene = new THREE.Scene();
+  var distCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  var distMat = new THREE.ShaderMaterial({
+    uniforms: { tex: { value: null }, k1: { value: 0.34 }, k2: { value: 0.55 } },
+    vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+    fragmentShader: [
+      'varying vec2 vUv;',
+      'uniform sampler2D tex; uniform float k1; uniform float k2;',
+      'void main() {',
+      '  vec2 uv = vUv * 2.0 - 1.0;',
+      '  float r2 = dot(uv, uv);',
+      '  float f = (1.0 + k1 * r2 + k2 * r2 * r2) / (1.0 + k1 + k2);',
+      '  vec2 suv = uv * f * 0.5 + 0.5;',
+      '  if (suv.x <= 0.001 || suv.x >= 0.999 || suv.y <= 0.001 || suv.y >= 0.999) {',
+      '    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;',
+      '  }',
+      '  float vig = smoothstep(1.0, 0.92, length(uv));',
+      '  gl_FragColor = vec4(texture2D(tex, suv).rgb * vig, 1.0);',
+      '}',
+    ].join('\n'),
+    depthTest: false,
+    depthWrite: false,
+  });
+  distScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), distMat));
+
+  var eyeShift = new THREE.Vector3();
+
+  function allocTargets() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 3);
+    var tw = Math.max(2, Math.floor(window.innerWidth / 2 * dpr * 1.15)); // slight supersample:
+    var th = Math.max(2, Math.floor(window.innerHeight * dpr * 1.15));    // distortion magnifies the centre
+    if (rtL) rtL.dispose();
+    if (rtR) rtR.dispose();
+    rtL = new THREE.WebGLRenderTarget(tw, th, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    rtR = new THREE.WebGLRenderTarget(tw, th, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+  }
+
   function onResize() {
     renderer.setSize(window.innerWidth, window.innerHeight, false);
+    allocTargets();
   }
   window.addEventListener('resize', onResize);
   onResize();
+
+  function renderEye(layer, sign, rt) {
+    camera.layers.set(layer);
+    eyeShift.set(sign * IPD / 2, 0, 0).applyQuaternion(camera.quaternion);
+    camera.position.copy(eyeShift);
+    renderer.setRenderTarget(rt);
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+  }
 
   function animate() {
     requestAnimationFrame(animate);
     updateCamera();
     var w = window.innerWidth, h = window.innerHeight;
+
+    if (viewMode === '360') {
+      // magic window: one fullscreen undistorted view, look around by moving the phone
+      camera.layers.set(1);
+      camera.position.set(0, 0, 0);
+      camera.fov = 80;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, w, h);
+      renderer.render(scene, camera);
+      return;
+    }
+
     var half = Math.floor(w / 2);
+    camera.fov = VR_FOV;
     camera.aspect = half / h;
     camera.updateProjectionMatrix();
+    renderEye(1, -1, rtL);
+    renderEye(2, 1, rtR);
     renderer.setScissorTest(true);
-    // left eye
-    camera.layers.set(1);
+    distMat.uniforms.tex.value = rtL.texture;
     renderer.setViewport(0, 0, half, h);
     renderer.setScissor(0, 0, half, h);
-    renderer.render(scene, camera);
-    // right eye
-    camera.layers.set(2);
+    renderer.render(distScene, distCam);
+    distMat.uniforms.tex.value = rtR.texture;
     renderer.setViewport(half, 0, w - half, h);
     renderer.setScissor(half, 0, w - half, h);
-    renderer.render(scene, camera);
+    renderer.render(distScene, distCam);
   }
   animate();
 
@@ -182,19 +255,39 @@
 
   function setStatus(msg) { gateStatus.textContent = msg; }
 
-  function bindGroup(id, apply) {
+  function setGroup(id, val) {
+    document.getElementById(id).querySelectorAll('button').forEach(function (x) {
+      x.classList.toggle('on', x.dataset.v === val);
+    });
+  }
+
+  function bindGroup(id, key, apply) {
     var grp = document.getElementById(id);
     grp.addEventListener('click', function (e) {
       var b = e.target.closest('button');
       if (!b) return;
-      grp.querySelectorAll('button').forEach(function (x) { x.classList.remove('on'); });
-      b.classList.add('on');
+      setGroup(id, b.dataset.v);
       apply(b.dataset.v);
+      try { localStorage.setItem('vrp.' + key, b.dataset.v); } catch (err) { /* private mode */ }
       rebuild();
     });
+    // restore last-used setting
+    var saved = null;
+    try { saved = localStorage.getItem('vrp.' + key); } catch (err) { /* private mode */ }
+    if (saved && grp.querySelector('[data-v="' + saved + '"]')) {
+      setGroup(id, saved);
+      apply(saved);
+    }
   }
-  bindGroup('proj', function (v) { projection = v; });
-  bindGroup('stereo', function (v) { stereo = v; });
+
+  var divider = document.getElementById('divider');
+  function updateDivider() { divider.style.display = viewMode === 'vr' ? '' : 'none'; }
+
+  bindGroup('proj', 'projection', function (v) { projection = v; });
+  bindGroup('stereo', 'stereo', function (v) { stereo = v; });
+  bindGroup('view', 'view', function (v) { viewMode = v; updateDivider(); });
+  updateDivider();
+  rebuild();
 
   var qualityGrp = document.getElementById('quality');
   qualityGrp.addEventListener('click', function (e) {

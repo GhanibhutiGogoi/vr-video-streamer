@@ -31,14 +31,20 @@ session, or region streams to the phone with none of that configured on it.
   unknown sites
 - **VPN / session passthrough**: extraction uses your Chrome cookies and all
   bytes flow through the Mac, so the phone needs no VPN, account, or region
-- **Cardboard VR player in Safari** — no app store: Three.js side-by-side
-  stereo rendering, gyroscope head tracking, 360° / 180° / flat projections,
-  mono / side-by-side / top-bottom 3D layouts, fullscreen, recenter
+- **Cardboard VR player in Safari** — no app store: Three.js stereo rendering
+  with **barrel lens correction** (the round per-eye viewports real Cardboard
+  apps use), optics-matched field of view for a true-to-scale feel, real
+  inter-eye separation for 3D depth, gyroscope head tracking, 360° / 180° /
+  flat projections, mono / side-by-side / top-bottom layouts, fullscreen,
+  recenter
+- **Two viewing modes**: **VR** (headset: dual distorted eyes) and **360**
+  (handheld magic window: one fullscreen view, look around by moving the
+  phone). Settings are remembered between sessions
 - **Automatic compatibility transcoding**: AV1/VP9 video (which iPhones can't
   decode) is hardware-transcoded to HEVC on the Mac and delivered as HLS;
   wrong-container files (MKV, WebM) are losslessly remuxed
-- **Dynamic quality menu** showing the renditions each video actually offers
-  (capped at 2K by default — `MAX_HEIGHT=2160 npm start` to change)
+- **Dynamic quality menu** showing the renditions each video actually offers,
+  up to 4K (`MAX_HEIGHT=1440 npm start` to cap lower on slow connections)
 - **Smooth playback**: read-ahead chunk caching and HLS segment prefetching on
   the Mac, so seeks and playback don't wait on CDN round-trips
 - **Two-way remote control**: play/pause/seek/quality from the phone HUD *or*
@@ -91,9 +97,10 @@ and drag the **▶ Send to VR** button to your bookmarks bar.
 3. Browse to any video on the Mac → click **▶ Send to VR**.
 
 **In-headset:** single tap = menu · double tap = play/pause. The menu has
-projection (360°/180°/flat), 3D layout, quality, ±5s skip, recenter, and
-fullscreen. The phone can't auto-detect whether a video is 360° or flat, so
-pick the matching projection once — it sticks.
+view mode (VR headset / 360 handheld), projection (360°/180°/flat), 3D layout,
+quality, ±5s skip, recenter, and fullscreen. The phone can't auto-detect
+whether a video is 360° or flat, so pick the matching projection once — all
+settings are remembered.
 
 **From the Mac:** the `/remote` page doubles as a live remote — title, seek
 bar, play/pause, ±5s, quality — mirroring the headset in real time.
@@ -110,8 +117,9 @@ from disk; MKV/WebM/AV1 files are remuxed or transcoded on the fly.
   it. System-wide VPN apps work.
 - Some YouTube 360° videos use EAC projection and look warped (equirectangular
   support only, for now).
-- 4K is off by default: between CDN throttling and real-time transcoding, 2K
-  is the practical ceiling on most connections. Raise `MAX_HEIGHT` to try.
+- 4K needs the *internet* side (video site → Mac) to sustain roughly the
+  source bitrate (~15–25 Mbps). If it rebuffers, drop to 2K in the quality
+  menu or start the server with `MAX_HEIGHT=1440`.
 - If your Mac's Wi-Fi IP changes, delete `certs/`, re-run `./setup.sh`, and
   redo the trust steps (or use the `https://<hostname>.local:8443` address,
   which survives IP changes).
