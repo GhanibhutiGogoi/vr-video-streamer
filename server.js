@@ -253,12 +253,57 @@ function fillHlsHeights(picked, cb) {
   }, 0, 8000);
 }
 
+/*
+ * Seek-bar preview thumbnails. After a video is sent, a background job
+ * extracts one small frame every few seconds (range-seeking into the source,
+ * so it never downloads the whole file). The Mac remote shows them on hover.
+ */
+let thumbJob = null; // { id, dir, canceled, child }
+
+function startThumbs() {
+  if (thumbJob) {
+    thumbJob.canceled = true;
+    try { if (thumbJob.child) thumbJob.child.kill('SIGKILL'); } catch (e) { /* gone */ }
+    thumbJob = null;
+  }
+  if (!FFMPEG || !current) return;
+  const duration = (current.info && current.info.duration) || current.localDuration || 0;
+  if (!duration || duration < 8) return;
+  const interval = Math.max(5, Math.ceil(duration / 60)); // at most ~60 previews
+  const count = Math.max(1, Math.floor(duration / interval));
+  const src = current.kind === 'merge'
+    ? { url: current.video.url, headers: current.video.headers }
+    : { url: current.streamUrl, headers: current.headers };
+  const id = 'thumbs-' + Date.now();
+  const dir = path.join(HLS_ROOT, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const job = { id, dir, canceled: false, child: null };
+  thumbJob = job;
+  current.thumbs = { v: id, interval, count };
+  console.log(`[thumbs] generating ${count} previews (every ${interval}s)`);
+  const headerArgs = /^https?:/i.test(src.url)
+    ? ['-headers', Object.entries(src.headers || {}).map(([k, v]) => k + ': ' + v).join('\r\n') + '\r\n']
+    : [];
+  (function next(i) {
+    if (job.canceled) return;
+    if (i >= count) { console.log('[thumbs] done'); return; }
+    const t = Math.round(i * interval + interval / 2);
+    const args = ['-hide_banner', '-loglevel', 'error', '-ss', String(t), ...headerArgs,
+      '-i', src.url, '-frames:v', '1', '-vf', 'scale=200:-2', '-q:v', '6', '-y',
+      path.join(dir, i + '.jpg')];
+    job.child = spawn('ffmpeg', args);
+    const timer = setTimeout(() => { try { job.child.kill('SIGKILL'); } catch (e) { /* gone */ } }, 20000);
+    job.child.on('close', () => { clearTimeout(timer); setTimeout(() => next(i + 1), 50); });
+  })(0);
+}
+
 // Re-extraction returns a bare pick again — keep what an earlier ffprobe
 // learned so downscaling/transcoding decisions survive link refreshes.
 function carryProbedInfo(picked) {
   if (!current) return;
   if (!picked.height && current.height) picked.height = current.height;
   if (!picked.localDuration && current.localDuration) picked.localDuration = current.localDuration;
+  if (!picked.thumbs && current.thumbs) picked.thumbs = current.thumbs;
   if (picked.kind === 'file' && current.kind === 'transcode' && current.vTranscode !== undefined) {
     picked.kind = 'transcode';
     picked.vTranscode = current.vTranscode;
@@ -306,6 +351,7 @@ function applyQuality() {
       repick.info = current.info;
       repick.pageUrl = current.pageUrl;
       repick.extractedAt = current.extractedAt; // repicked URLs are as old as their extraction
+      repick.thumbs = current.thumbs; // previews stay valid — same video
       if (!(repick.heights && repick.heights.length) && current.heights) {
         repick.heights = current.heights; // keep manifest-derived heights across repicks
       }
@@ -756,6 +802,7 @@ function videoMessage() {
     type: 'video', title: current.title, kind: scaled ? 'transcode' : current.kind, src: '/stream',
     heights: menuHeights(), quality: preferredHeight,
     duration: (current.info && current.info.duration) || current.localDuration || 0,
+    thumbs: current.thumbs || null,
   };
 }
 
@@ -804,6 +851,7 @@ function sendLocal(file, res) {
       current = Object.assign(base, { kind: 'transcode', vTranscode: !vSafe, aTranscode: !aSafe });
     }
     updateScaleTarget();
+    startThumbs();
     console.log(`[send] ok: "${title}" (local ${current.kind === 'localfile' ? 'direct' : (current.vTranscode ? 're-encode' : 'remux')}${current.scaleTo ? ', downscaling to ' + current.scaleTo + 'p' : ''})`);
     broadcast(videoMessage());
     send(res, 200, okPage(title), { 'Content-Type': 'text/html; charset=utf-8' });
@@ -1020,6 +1068,7 @@ function requestHandler(req, res) {
         clearStreamCaches();
         current = picked;
         updateScaleTarget();
+        startThumbs();
         console.log(`[send] ok: "${picked.title}" (${picked.kind}${picked.height ? ', ' + picked.height + 'p' : ''}${current.scaleTo ? ', downscaling to ' + current.scaleTo + 'p' : ''})`);
         broadcast(videoMessage());
         send(res, 200, okPage(picked.title), { 'Content-Type': 'text/html; charset=utf-8' });
@@ -1065,6 +1114,15 @@ function requestHandler(req, res) {
       waiting.forEach(fn => fn());
     });
     return;
+  }
+
+  if (p === '/thumb') {
+    const v = u.searchParams.get('v');
+    const i = Number(u.searchParams.get('i'));
+    if (!thumbJob || v !== thumbJob.id || !Number.isInteger(i) || i < 0) return send(res, 404, 'no thumbnails');
+    const abs = path.join(thumbJob.dir, i + '.jpg');
+    if (!fs.existsSync(abs)) return send(res, 404, 'not generated yet');
+    return send(res, 200, fs.readFileSync(abs), { 'Content-Type': 'image/jpeg', 'Cache-Control': 'max-age=86400' });
   }
 
   if (p.startsWith('/hls/')) {
