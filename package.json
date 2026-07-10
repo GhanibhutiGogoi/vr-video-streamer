@@ -2,7 +2,7 @@
   "name": "vr-video-streamer",
   "version": "0.1.0",
   "private": true,
-  "description": "Send any video from your Mac browser to your iPhone as a Cardboard VR stream. The Mac fetches the video (VPN-friendly); the phone only displays it.",
+  "description": "Send any video from your computer's browser to your phone as a Cardboard VR stream. The computer fetches the video (VPN-friendly); the phone only displays it.",
   "scripts": {
     "start": "node server.js"
   },

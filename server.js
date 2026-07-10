@@ -63,12 +63,26 @@ let refreshWaiters = null;
 const MAX_HEIGHT = Number(process.env.MAX_HEIGHT) || 2160;
 
 // ffmpeg unlocks resolutions that only exist as separate video/audio streams
-// (e.g. YouTube above 1080p) by merging them on the fly.
+// (e.g. YouTube above 1080p) by merging them on the fly. The transcode
+// encoder is picked per platform: Apple hardware (VideoToolbox) on macOS,
+// NVIDIA/Intel hardware elsewhere when present, software x264 as fallback.
 let FFMPEG = false;
-execFile('ffmpeg', ['-version'], e => {
+let VENC = { codec: 'libx264', tag: null, hwaccel: null, extra: ['-preset', 'veryfast', '-pix_fmt', 'yuv420p'] };
+execFile('ffmpeg', ['-hide_banner', '-encoders'], (e, out) => {
   FFMPEG = !e;
-  console.log(FFMPEG ? '[init] ffmpeg found — high-resolution merge mode enabled'
-                     : '[init] ffmpeg not found — resolutions above muxed formats unavailable (brew install ffmpeg)');
+  if (e) {
+    console.log('[init] ffmpeg not found — transcoding and high-res merge unavailable (install ffmpeg)');
+    return;
+  }
+  const has = name => String(out).includes(' ' + name + ' ');
+  if (process.platform === 'darwin' && has('hevc_videotoolbox')) {
+    VENC = { codec: 'hevc_videotoolbox', tag: 'hvc1', hwaccel: 'videotoolbox', extra: [] };
+  } else if (has('h264_nvenc')) {
+    VENC = { codec: 'h264_nvenc', tag: null, hwaccel: null, extra: ['-preset', 'p4'] };
+  } else if (has('h264_qsv')) {
+    VENC = { codec: 'h264_qsv', tag: null, hwaccel: null, extra: [] };
+  }
+  console.log('[init] ffmpeg found — transcode encoder: ' + VENC.codec);
 });
 
 // ---------------------------------------------------------------- utilities
@@ -969,7 +983,7 @@ function startHlsSession(t) {
   const args = ['-hide_banner', '-loglevel', 'error'];
   if (t) args.push('-ss', String(t));
   // hardware decode where possible (falls back to software automatically)
-  if (vSrc.transcode) args.push('-hwaccel', 'videotoolbox');
+  if (vSrc.transcode && VENC.hwaccel) args.push('-hwaccel', VENC.hwaccel);
   if (/^https?:/i.test(vSrc.url)) args.push(...netFlags, '-headers', headerBlob(vSrc.headers));
   args.push('-i', vSrc.url);
   if (single) {
@@ -985,7 +999,9 @@ function startHlsSession(t) {
     // LAN hop to the phone is never the bottleneck
     const bh = scaleTo || current.height || 1080;
     const bv = bh >= 2160 ? '36M' : bh >= 1440 ? '20M' : '12M';
-    args.push('-c:v', 'hevc_videotoolbox', '-b:v', bv, '-tag:v', 'hvc1');
+    args.push('-c:v', VENC.codec, '-b:v', bv);
+    if (VENC.tag) args.push('-tag:v', VENC.tag);
+    if (VENC.extra.length) args.push(...VENC.extra);
   } else {
     args.push('-c:v', 'copy');
   }
@@ -1246,13 +1262,15 @@ const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <body style="font-family:system-ui;max-width:34em;margin:2em auto;padding:0 1em;line-height:1.5">
-<h1>&#127918; VR Streamer &mdash; one-time iPhone setup</h1>
-<ol>
-<li><a href="/cert"><b>Download the certificate</b></a> (tap Allow)</li>
-<li>Open <b>Settings</b> &rsaquo; <b>Profile Downloaded</b> &rsaquo; Install</li>
-<li>Then <b>Settings</b> &rsaquo; <b>General</b> &rsaquo; <b>About</b> &rsaquo; <b>Certificate Trust Settings</b> &rsaquo; turn ON full trust for &ldquo;VR Video Streamer&rdquo;</li>
-<li>Open <a href="https://${localIp()}:${HTTPS_PORT}"><b>https://${localIp()}:${HTTPS_PORT}</b></a> in Safari &mdash; that&rsquo;s the VR player</li>
-</ol></body>`);
+<h1>&#127918; VR Streamer &mdash; one-time phone setup</h1>
+<p><a href="/cert"><b>1. Download the certificate</b></a></p>
+<p><b>2. Install &amp; trust it:</b></p>
+<ul>
+<li><b>iPhone:</b> Settings &rsaquo; <b>Profile Downloaded</b> &rsaquo; Install, then Settings &rsaquo; General &rsaquo; About &rsaquo; <b>Certificate Trust Settings</b> &rsaquo; turn ON full trust for &ldquo;VR Video Streamer&rdquo;</li>
+<li><b>Android:</b> Settings &rsaquo; Security &rsaquo; More security settings &rsaquo; <b>Install from device storage</b> &rsaquo; <b>CA certificate</b> &rsaquo; pick the downloaded file (wording varies by vendor)</li>
+</ul>
+<p><b>3.</b> Open <a href="https://${localIp()}:${HTTPS_PORT}"><b>https://${localIp()}:${HTTPS_PORT}</b></a> in Safari (iPhone) or Chrome (Android) &mdash; that&rsquo;s the VR player</p>
+</body>`);
 });
 
 httpsServer.listen(HTTPS_PORT, () => {
@@ -1260,9 +1278,9 @@ httpsServer.listen(HTTPS_PORT, () => {
   console.log('');
   console.log('  VR Video Streamer running');
   console.log('  ─────────────────────────');
-  console.log(`  iPhone player (Safari):   https://${ip}:${HTTPS_PORT}`);
-  console.log(`  Mac remote + bookmarklet: https://${ip}:${HTTPS_PORT}/remote`);
-  console.log(`  iPhone first-time setup:  http://${ip}:${HTTP_PORT}`);
+  console.log(`  Phone VR player:          https://${ip}:${HTTPS_PORT}`);
+  console.log(`  Remote + bookmarklet:     https://${ip}:${HTTPS_PORT}/remote`);
+  console.log(`  Phone first-time setup:   http://${ip}:${HTTP_PORT}`);
   try {
     const hn = os.hostname().replace(/\.$/, '');
     console.log(`  (hostname alternative:    https://${hn.split('.')[0]}.local:${HTTPS_PORT})`);
