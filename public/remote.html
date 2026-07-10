@@ -23,8 +23,9 @@
              padding: 0; border: none; border-radius: 3px; outline: none; cursor: pointer;
              background: linear-gradient(to right, #4b8fd4 0%, #3a3f47 0%); display: block; }
   #np-seek::-webkit-slider-thumb { -webkit-appearance: none; width: 13px; height: 13px;
-             border-radius: 50%; background: #6cb2f7; border: none; transition: transform .12s; }
-  #np-seek:hover::-webkit-slider-thumb, #np-seek:active::-webkit-slider-thumb { transform: scale(1.35); }
+             border-radius: 50%; background: #6cb2f7; border: none;
+             transform: scale(0); transition: transform .12s; } /* hidden until hover, like YouTube */
+  #np-seek:hover::-webkit-slider-thumb, #np-seek:active::-webkit-slider-thumb { transform: scale(1); }
   #np-seek::-moz-range-thumb { width: 13px; height: 13px; border-radius: 50%;
              background: #6cb2f7; border: none; }
   #np-preview { position: absolute; bottom: 26px; transform: translateX(-50%); display: none;
@@ -133,13 +134,30 @@ function previewAt(clientX) {
     var url = '/thumb?v=' + encodeURIComponent(thumbsMeta.v) + '&i=' + idx;
     if (prevImg.dataset.src !== url) {
       prevImg.dataset.src = url;
-      prevImg.onload = function () { prevImg.style.display = 'block'; };
-      prevImg.onerror = function () { prevImg.style.display = 'none'; }; // not generated yet
-      prevImg.src = url;
+      prevImg.dataset.tries = '0';
+      loadThumb(url);
     }
   } else {
     prevImg.style.display = 'none';
   }
+}
+
+// a miss makes the server prioritise that frame — retry until it lands
+function loadThumb(url) {
+  prevImg.onload = function () { prevImg.style.display = 'block'; };
+  prevImg.onerror = function () {
+    prevImg.style.display = 'none';
+    var tries = Number(prevImg.dataset.tries || 0) + 1;
+    prevImg.dataset.tries = String(tries);
+    if (tries <= 10) {
+      setTimeout(function () {
+        if (prevImg.dataset.src === url && preview.style.display !== 'none') {
+          prevImg.src = url + '&r=' + tries;
+        }
+      }, 1200);
+    }
+  };
+  prevImg.src = url;
 }
 
 seekBar.addEventListener('pointermove', function (e) { previewAt(e.clientX); });

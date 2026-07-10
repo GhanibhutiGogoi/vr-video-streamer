@@ -211,6 +211,7 @@
   function animate() {
     requestAnimationFrame(animate);
     updateCamera();
+    if (typeof reticle !== 'undefined' && reticle) updateGaze(viewMode !== '360');
     var w = window.innerWidth, h = window.innerHeight;
 
     if (viewMode === '360') {
@@ -445,6 +446,265 @@
     showToast('Video error' + (err ? ' (code ' + err.code + ')' : ''));
   });
   vid.addEventListener('playing', function () { showToast('Playing'); });
+
+  // ------------------------------------------------- gaze (dwell) VR menu
+  // In-headset controls: look at a button and hold your gaze — a ring fills
+  // around the reticle and the button triggers. No touch needed.
+  var DWELL_MS = 1500; // hold-to-select time
+
+  scene.add(camera); // so the reticle can ride on the camera
+
+  function uiRoundRect(g, x, y, w, h, r) {
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.arcTo(x + w, y, x + w, y + h, r);
+    g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r);
+    g.arcTo(x, y, x + w, y, r);
+    g.closePath();
+  }
+
+  function labelTexture(text, active) {
+    var c = document.createElement('canvas');
+    c.width = 256; c.height = 128;
+    var g = c.getContext('2d');
+    g.fillStyle = active ? 'rgba(58, 128, 190, 0.95)' : 'rgba(16, 20, 28, 0.85)';
+    uiRoundRect(g, 6, 14, 244, 100, 24);
+    g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.3)';
+    g.lineWidth = 3;
+    uiRoundRect(g, 6, 14, 244, 100, 24);
+    g.stroke();
+    g.fillStyle = '#fff';
+    g.font = '600 44px -apple-system, sans-serif';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(text, 128, 66);
+    return new THREE.CanvasTexture(c);
+  }
+
+  function makeButton(label, action, w) {
+    var mat = new THREE.MeshBasicMaterial({ map: labelTexture(label, false), transparent: true });
+    var m = new THREE.Mesh(new THREE.PlaneGeometry(w || 0.55, 0.28), mat);
+    m.userData = { action: action, tex: mat.map, texHover: labelTexture(label, true) };
+    m.layers.enable(1);
+    m.layers.enable(2);
+    return m;
+  }
+
+  var vrUI = { panelOpen: false, gazeTarget: null, gazeStart: 0, lastPanelUse: 0, buttons: [], toggleBtn: null };
+
+  // "menu" pill floating off to the right of your view — out of the way of
+  // the video, one glance away. It holds still while you look at it and only
+  // re-parks to your right when you've turned far away.
+  var OPENER_OFFSET = 0.75; // ~43° to the right
+  var opener = makeButton('☰ Menu', 'open', 0.6);
+  opener.position.set(0, -0.55, -1.98); // ~16° below the group's facing
+  var openerGroup = new THREE.Group();
+  openerGroup.rotation.y = -OPENER_OFFSET;
+  openerGroup.add(opener);
+  scene.add(openerGroup);
+
+  var panel = new THREE.Group();
+  [
+    ['↩ 5s', 'back', -0.62, 0],
+    ['▶', 'toggle', 0, 0],
+    ['5s ↪', 'fwd', 0.62, 0],
+    ['⟳ Recenter', 'recenter', -0.33, -0.34],
+    ['✕ Close', 'close', 0.33, -0.34],
+  ].forEach(function (d) {
+    var b = makeButton(d[0], d[1], 0.55);
+    b.position.set(d[2], d[3] - 0.45, -2);
+    panel.add(b);
+    vrUI.buttons.push(b);
+    if (d[1] === 'toggle') vrUI.toggleBtn = b;
+  });
+  // gaze-seekable timeline: a marker follows your gaze along the bar; hold
+  // steady and it seeks to that time
+  var seekCanvas = document.createElement('canvas');
+  seekCanvas.width = 512;
+  seekCanvas.height = 80;
+  var seekCtx = seekCanvas.getContext('2d');
+  var seekTex = new THREE.CanvasTexture(seekCanvas);
+  var seekBar3D = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.7, 0.26),
+    new THREE.MeshBasicMaterial({ map: seekTex, transparent: true })
+  );
+  seekBar3D.position.set(0, -0.12, -2);
+  seekBar3D.userData = { action: 'seekbar' };
+  seekBar3D.layers.enable(1);
+  seekBar3D.layers.enable(2);
+  panel.add(seekBar3D);
+  vrUI.buttons.push(seekBar3D);
+
+  function fmtT(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    var m = Math.floor(s / 60), sec = ('0' + (s % 60)).slice(-2);
+    return Math.floor(m / 60) ? Math.floor(m / 60) + ':' + ('0' + (m % 60)).slice(-2) + ':' + sec : m + ':' + sec;
+  }
+
+  function drawSeekBar(gazeFrac) {
+    var g = seekCtx, W = 512, H = 80;
+    var dur = totalDuration || vid.duration || 0;
+    g.clearRect(0, 0, W, H);
+    g.fillStyle = 'rgba(16,20,28,0.85)';
+    uiRoundRect(g, 2, 46, W - 4, 22, 11);
+    g.fill();
+    if (dur) {
+      var pos = Math.min(1, (baseOffset + (vid.currentTime || 0)) / dur);
+      if (pos > 0.01) {
+        g.fillStyle = '#4b8fd4';
+        uiRoundRect(g, 2, 46, Math.max(12, pos * (W - 4)), 22, 11);
+        g.fill();
+      }
+      if (gazeFrac !== null && gazeFrac !== undefined) {
+        var x = Math.max(8, Math.min(W - 8, gazeFrac * W));
+        g.fillStyle = '#fff';
+        g.fillRect(x - 2, 40, 4, 34);
+        g.font = '600 28px -apple-system, sans-serif';
+        g.textAlign = 'center';
+        g.fillText(fmtT(gazeFrac * dur), Math.max(40, Math.min(W - 40, x)), 28);
+      }
+    }
+    seekTex.needsUpdate = true;
+  }
+  drawSeekBar(null);
+
+  panel.visible = false;
+  scene.add(panel);
+
+  function refreshToggleLabel() {
+    var label = vid.paused ? '▶ Play' : '❘❘ Pause';
+    var b = vrUI.toggleBtn;
+    b.userData.tex = labelTexture(label, false);
+    b.userData.texHover = labelTexture(label, true);
+    b.material.map = (vrUI.gazeTarget === b) ? b.userData.texHover : b.userData.tex;
+  }
+  vid.addEventListener('play', refreshToggleLabel);
+  vid.addEventListener('pause', refreshToggleLabel);
+
+  // reticle dot + dwell progress ring, fixed at the centre of vision
+  var reticle = new THREE.Mesh(
+    new THREE.CircleGeometry(0.008, 24),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.45, depthTest: false })
+  );
+  reticle.position.set(0, 0, -1.5);
+  reticle.renderOrder = 999;
+  reticle.layers.enable(1);
+  reticle.layers.enable(2);
+  camera.add(reticle);
+
+  var ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.016, 0.027, 32),
+    new THREE.MeshBasicMaterial({ color: 0x6cb2f7, transparent: true, opacity: 0.95, depthTest: false })
+  );
+  ring.position.set(0, 0, -1.49);
+  ring.renderOrder = 1000;
+  ring.visible = false;
+  ring.layers.enable(1);
+  ring.layers.enable(2);
+  camera.add(ring);
+
+  function setRingProgress(frac) {
+    ring.geometry.dispose();
+    ring.geometry = new THREE.RingGeometry(0.016, 0.027, 32, 1, -Math.PI / 2, Math.max(0.001, frac * Math.PI * 2));
+  }
+
+  function yawOf(quat) {
+    var f = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
+    return Math.atan2(-f.x, -f.z);
+  }
+
+  function showPanel() {
+    panel.rotation.y = yawOf(camera.quaternion); // open facing the user
+    vrUI.panelOpen = true;
+    vrUI.lastPanelUse = Date.now();
+  }
+  function hidePanel() { vrUI.panelOpen = false; }
+
+  function gazeAction(action) {
+    if (action === 'open') showPanel();
+    else if (action === 'close') hidePanel();
+    else if (action === 'toggle') togglePlay();
+    else if (action === 'back') skipBy(-5);
+    else if (action === 'fwd') skipBy(5);
+    else if (action === 'recenter') recenter();
+    if (action !== 'open' && action !== 'close') vrUI.lastPanelUse = Date.now();
+  }
+
+  var raycaster = new THREE.Raycaster();
+  var gazeOrigin = new THREE.Vector3();
+  var gazeDir = new THREE.Vector3();
+
+  function updateGaze(inVR) {
+    reticle.visible = inVR;
+    openerGroup.visible = inVR && !vrUI.panelOpen;
+    panel.visible = inVR && vrUI.panelOpen;
+    if (!inVR) { ring.visible = false; return; }
+
+    // re-park the pill to your right only when you've turned well away from
+    // it — a dead zone keeps it still while you're looking at or near it
+    if (openerGroup.visible) {
+      var desired = yawOf(camera.quaternion) - OPENER_OFFSET;
+      var cur = openerGroup.rotation.y;
+      var d = Math.atan2(Math.sin(desired - cur), Math.cos(desired - cur));
+      if (Math.abs(d) > 1.2) openerGroup.rotation.y = cur + d * 0.08;
+    }
+    if (vrUI.panelOpen && Date.now() - vrUI.lastPanelUse > 12000) hidePanel();
+
+    var targets = vrUI.panelOpen ? vrUI.buttons : [opener];
+    gazeDir.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    raycaster.set(gazeOrigin.set(0, 0, 0), gazeDir);
+    var hit = raycaster.intersectObjects(targets, false)[0];
+    var btn = hit ? hit.object : null;
+    var onSeekbar = btn && btn.userData.action === 'seekbar';
+
+    if (btn !== vrUI.gazeTarget) {
+      var prev = vrUI.gazeTarget;
+      if (prev && prev.userData.tex) prev.material.map = prev.userData.tex;
+      vrUI.gazeTarget = btn;
+      vrUI.gazeStart = Date.now();
+      if (onSeekbar) vrUI.seekFrac = hit.uv.x;
+      if (btn) {
+        if (btn.userData.texHover) btn.material.map = btn.userData.texHover;
+        vrUI.lastPanelUse = Date.now();
+        setRingProgress(0);
+      }
+      ring.visible = !!btn;
+    } else if (btn) {
+      vrUI.lastPanelUse = Date.now();
+      if (onSeekbar) {
+        // dwell restarts whenever the gaze slides along the bar — it only
+        // fires after holding STILL on one spot
+        var f = hit.uv.x;
+        if (Math.abs(f - vrUI.seekFrac) > 0.035) {
+          vrUI.seekFrac = f;
+          vrUI.gazeStart = Date.now();
+        }
+      }
+      var frac = (Date.now() - vrUI.gazeStart) / DWELL_MS;
+      setRingProgress(Math.min(1, frac));
+      if (frac >= 1) {
+        if (onSeekbar) {
+          var dur = totalDuration || vid.duration || 0;
+          if (dur) {
+            seekTo(vrUI.seekFrac * dur);
+            showToast('▶ ' + fmtT(vrUI.seekFrac * dur));
+          }
+          vrUI.gazeStart = Date.now(); // re-arm without leaving the bar
+          setRingProgress(0);
+        } else {
+          if (btn.userData.tex) btn.material.map = btn.userData.tex;
+          gazeAction(btn.userData.action);
+          vrUI.gazeTarget = null;
+          ring.visible = false;
+        }
+      }
+    }
+
+    // live progress + gaze marker on the timeline while the panel is open
+    if (vrUI.panelOpen) drawSeekBar(onSeekbar ? vrUI.seekFrac : null);
+  }
 
   // -------------------------------------------------------------- WebSocket
   var ws;

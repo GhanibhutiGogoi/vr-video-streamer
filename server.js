@@ -277,24 +277,49 @@ function startThumbs() {
   const id = 'thumbs-' + Date.now();
   const dir = path.join(HLS_ROOT, id);
   fs.mkdirSync(dir, { recursive: true });
-  const job = { id, dir, canceled: false, child: null };
+  // Coarse-to-fine order: middle first, then quarters, eighths… so the whole
+  // timeline gets preview coverage within seconds, densifying over time.
+  const order = [];
+  {
+    const seen = new Set();
+    const q = [[0, count - 1]];
+    while (q.length) {
+      const [lo, hi] = q.shift();
+      if (lo > hi) continue;
+      const mid = (lo + hi) >> 1;
+      if (!seen.has(mid)) { seen.add(mid); order.push(mid); }
+      q.push([lo, mid - 1], [mid + 1, hi]);
+    }
+  }
+
+  const job = { id, dir, canceled: false, child: null, queue: order, priority: [], made: new Set(), busy: false };
   thumbJob = job;
   current.thumbs = { v: id, interval, count };
-  console.log(`[thumbs] generating ${count} previews (every ${interval}s)`);
+  console.log(`[thumbs] generating ${count} previews (every ${interval}s, middle-out)`);
   const headerArgs = /^https?:/i.test(src.url)
     ? ['-headers', Object.entries(src.headers || {}).map(([k, v]) => k + ': ' + v).join('\r\n') + '\r\n']
     : [];
-  (function next(i) {
-    if (job.canceled) return;
-    if (i >= count) { console.log('[thumbs] done'); return; }
+
+  function makeOne(i, done) {
     const t = Math.round(i * interval + interval / 2);
     const args = ['-hide_banner', '-loglevel', 'error', '-ss', String(t), ...headerArgs,
       '-i', src.url, '-frames:v', '1', '-vf', 'scale=200:-2', '-q:v', '6', '-y',
       path.join(dir, i + '.jpg')];
     job.child = spawn('ffmpeg', args);
     const timer = setTimeout(() => { try { job.child.kill('SIGKILL'); } catch (e) { /* gone */ } }, 20000);
-    job.child.on('close', () => { clearTimeout(timer); setTimeout(() => next(i + 1), 50); });
-  })(0);
+    job.child.on('close', () => { clearTimeout(timer); job.made.add(i); done(); });
+  }
+
+  job.kick = function pump() {
+    if (job.canceled) { job.busy = false; return; }
+    const i = job.priority.length ? job.priority.shift() : job.queue.shift();
+    if (i === undefined) { job.busy = false; console.log('[thumbs] done'); return; }
+    job.busy = true;
+    if (job.made.has(i)) return pump();
+    makeOne(i, () => setTimeout(pump, 30));
+  };
+  job.busy = true;
+  job.kick();
 }
 
 // Re-extraction returns a bare pick again — keep what an earlier ffprobe
@@ -1121,7 +1146,14 @@ function requestHandler(req, res) {
     const i = Number(u.searchParams.get('i'));
     if (!thumbJob || v !== thumbJob.id || !Number.isInteger(i) || i < 0) return send(res, 404, 'no thumbnails');
     const abs = path.join(thumbJob.dir, i + '.jpg');
-    if (!fs.existsSync(abs)) return send(res, 404, 'not generated yet');
+    if (!fs.existsSync(abs)) {
+      // being hovered right now — jump the queue
+      if (!thumbJob.canceled && !thumbJob.made.has(i) && !thumbJob.priority.includes(i)) {
+        thumbJob.priority.push(i);
+        if (!thumbJob.busy) { thumbJob.busy = true; thumbJob.kick(); }
+      }
+      return send(res, 404, 'generating');
+    }
     return send(res, 200, fs.readFileSync(abs), { 'Content-Type': 'image/jpeg', 'Cache-Control': 'max-age=86400' });
   }
 
