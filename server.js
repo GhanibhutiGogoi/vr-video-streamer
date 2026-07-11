@@ -343,6 +343,9 @@ function carryProbedInfo(picked) {
   if (!picked.height && current.height) picked.height = current.height;
   if (!picked.localDuration && current.localDuration) picked.localDuration = current.localDuration;
   if (!picked.thumbs && current.thumbs) picked.thumbs = current.thumbs;
+  if (!(picked.heights && picked.heights.length) && current.heights && current.heights.length) {
+    picked.heights = current.heights; // manifest-derived quality lists survive refreshes too
+  }
   if (picked.kind === 'file' && current.kind === 'transcode' && current.vTranscode !== undefined) {
     picked.kind = 'transcode';
     picked.vTranscode = current.vTranscode;
@@ -1137,7 +1140,7 @@ function requestHandler(req, res) {
     };
     // CDNs throttle or expire aged signed URLs — grab a fresh link when a
     // stream starts more than a few minutes after extraction
-    const STALE_MS = 5 * 60 * 1000;
+    const STALE_MS = Number(process.env.STALE_MS) || 5 * 60 * 1000;
     if (!current.pageUrl || Date.now() - (current.extractedAt || 0) < STALE_MS) return dispatch();
     if (refreshWaiters) { refreshWaiters.push(dispatch); return; }
     console.log('[stream] link is stale — re-extracting a fresh one…');
@@ -1145,6 +1148,7 @@ function requestHandler(req, res) {
     extract(current.pageUrl, (err, picked) => {
       if (!err) {
         picked.pageUrl = current.pageUrl;
+        carryProbedInfo(picked);
         current = picked;
         applyQuality();
       } else {

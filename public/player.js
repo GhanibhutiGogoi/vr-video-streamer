@@ -151,22 +151,37 @@
   // the pincushion distortion of the headset lenses (the round "fisheye"
   // viewports real Cardboard apps show). k1/k2 are Cardboard v2-ish
   // coefficients; FOV is widened to optics scale so the world feels 1:1.
-  var VR_FOV = 96;
+  // Rendered FOV sets perceived world scale: wider FOV = more world in view =
+  // everything smaller. Adjustable from the HUD ("Size") since Cardboard
+  // clones vary; remembered per device.
+  var vrFov = 104;
+  try {
+    var savedFov = parseFloat(localStorage.getItem('vrp.fov'));
+    if (!isNaN(savedFov)) vrFov = savedFov;
+  } catch (e) { /* private mode */ }
+
+  function nudgeSize(d) {
+    // "Size −" widens the FOV (people shrink); "Size +" narrows it
+    vrFov = Math.max(78, Math.min(122, vrFov - d * 4));
+    try { localStorage.setItem('vrp.fov', String(vrFov)); } catch (e) { /* private mode */ }
+    showToast('World size: ' + Math.round(96 / vrFov * 100) + '%');
+  }
+
   var IPD = 0.064; // metres between the eye cameras (real depth on 3D content)
 
   var rtL = null, rtR = null;
   var distScene = new THREE.Scene();
   var distCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   var distMat = new THREE.ShaderMaterial({
-    uniforms: { tex: { value: null }, k1: { value: 0.34 }, k2: { value: 0.55 } },
+    uniforms: { tex: { value: null }, k1: { value: 0.34 }, k2: { value: 0.55 }, norm: { value: 1.89 } },
     vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
     fragmentShader: [
       'varying vec2 vUv;',
-      'uniform sampler2D tex; uniform float k1; uniform float k2;',
+      'uniform sampler2D tex; uniform float k1; uniform float k2; uniform float norm;',
       'void main() {',
       '  vec2 uv = vUv * 2.0 - 1.0;',
       '  float r2 = dot(uv, uv);',
-      '  float f = (1.0 + k1 * r2 + k2 * r2 * r2) / (1.0 + k1 + k2);',
+      '  float f = (1.0 + k1 * r2 + k2 * r2 * r2) / norm;',
       '  vec2 suv = uv * f * 0.5 + 0.5;',
       '  if (suv.x <= 0.001 || suv.x >= 0.999 || suv.y <= 0.001 || suv.y >= 0.999) {',
       '    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;',
@@ -179,6 +194,34 @@
     depthWrite: false,
   });
   distScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), distMat));
+
+  // Lens strength: 1.0 = official Cardboard v2 optics; cheap viewers usually
+  // want less. Negative values pre-distort the other way (pincushion /
+  // "bulged inward"). Adjustable from the HUD, remembered per device.
+  var LENS_K1 = 0.34, LENS_K2 = 0.55;
+  var lensStrength = 0.5;
+  try {
+    var savedLens = parseFloat(localStorage.getItem('vrp.lens'));
+    if (!isNaN(savedLens)) lensStrength = savedLens;
+  } catch (e) { /* private mode */ }
+
+  function applyLens() {
+    var k1 = LENS_K1 * lensStrength, k2 = LENS_K2 * lensStrength;
+    distMat.uniforms.k1.value = k1;
+    distMat.uniforms.k2.value = k2;
+    // positive: normalise so the image fills the eye edge-to-edge;
+    // negative: anchor the centre at 1:1 instead
+    distMat.uniforms.norm.value = Math.max(1, 1 + k1 + k2);
+  }
+  applyLens();
+
+  function nudgeLens(d) {
+    lensStrength = Math.max(-0.8, Math.min(1.6, Math.round((lensStrength + d) * 10) / 10));
+    applyLens();
+    try { localStorage.setItem('vrp.lens', String(lensStrength)); } catch (e) { /* private mode */ }
+    showToast('Lens distortion: ' + Math.round(lensStrength * 100) + '%' +
+      (lensStrength < 0 ? ' (inward)' : lensStrength === 0 ? ' (off)' : ''));
+  }
 
   var eyeShift = new THREE.Vector3();
 
@@ -228,7 +271,7 @@
     }
 
     var half = Math.floor(w / 2);
-    camera.fov = VR_FOV;
+    camera.fov = vrFov;
     camera.aspect = half / h;
     camera.updateProjectionMatrix();
     renderEye(1, -1, rtL);
@@ -354,6 +397,10 @@
 
   document.getElementById('recenter').addEventListener('click', recenter);
   document.getElementById('playpause').addEventListener('click', togglePlay);
+  document.getElementById('lensminus').addEventListener('click', function () { nudgeLens(-0.1); });
+  document.getElementById('lensplus').addEventListener('click', function () { nudgeLens(0.1); });
+  document.getElementById('sizeminus').addEventListener('click', function () { nudgeSize(-1); });
+  document.getElementById('sizeplus').addEventListener('click', function () { nudgeSize(1); });
   document.getElementById('back30').addEventListener('click', function () { skipBy(-5); });
   document.getElementById('fwd30').addEventListener('click', function () { skipBy(5); });
 
@@ -389,6 +436,8 @@
     else if (msg.action === 'pause') vid.pause();
     else if (msg.action === 'skip') skipBy(Number(msg.value) || 0);
     else if (msg.action === 'seek') seekTo(Number(msg.value) || 0);
+    else if (msg.action === 'lens') nudgeLens(Number(msg.value) || 0);
+    else if (msg.action === 'size') nudgeSize(Number(msg.value) || 0);
   }
 
   function togglePlay() {
@@ -735,6 +784,8 @@
       t: baseOffset + (vid.currentTime || 0),
       duration: totalDuration || vid.duration || 0,
       paused: vid.paused,
+      lens: lensStrength,
+      size: Math.round(96 / vrFov * 100),
     }));
   }, 1000);
 

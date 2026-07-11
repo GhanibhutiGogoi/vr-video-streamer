@@ -64,6 +64,13 @@
     <button class="ctl" data-act="skip" data-val="5">5s &#8631;</button>
   </div>
   <div id="np-quality" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+  <div class="hint" style="margin-top:14px">Headset calibration &mdash; <span id="np-cal">&mdash;</span></div>
+  <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap">
+    <button class="ctl" data-act="lens" data-val="-0.1">Lens &minus;</button>
+    <button class="ctl" data-act="lens" data-val="0.1">Lens +</button>
+    <button class="ctl" data-act="size" data-val="-1">Size &minus;</button>
+    <button class="ctl" data-act="size" data-val="1">Size +</button>
+  </div>
 </div>
 
 <script>
@@ -88,6 +95,10 @@ function wsConnect() {
       if (!dragging) { seek.value = Math.floor(msg.t || 0); updateFill(); }
       document.getElementById('np-time').textContent =
         fmt(msg.t) + ' / ' + fmt(msg.duration) + (msg.paused ? '  (paused)' : '');
+      if (msg.lens !== undefined) {
+        document.getElementById('np-cal').textContent =
+          'lens ' + Math.round(msg.lens * 100) + '% · size ' + msg.size + '%';
+      }
     }
   };
 }
